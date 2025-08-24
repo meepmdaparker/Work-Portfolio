@@ -1,0 +1,903 @@
+from typing import Dict, List, Set, Tuple
+from datetime import datetime
+
+import pandas as pd  # type:ignore
+
+from components.reports.vin_recommendation import VinRecommendationReportGenerator
+from constants.constants import (
+    ATP,
+    SKU,
+    AccentsAndBadging,
+    Architecture,
+    Audio,
+    Battery,
+    FinancialStatus,
+    Mats,
+    Motor,
+    OffRoad,
+    OrderTypeInternal,
+    Roof,
+    Speaker,
+    UtilityPanel,
+)
+from constants.datamodel import Build
+
+
+def get_input_data(path: str) -> pd.DataFrame:
+    return pd.read_parquet(path)
+
+
+def add_distribution_center_for_customer(customer_df: pd.DataFrame) -> pd.DataFrame:
+    # customer_df = customer_df.loc[~customer_df[Build.DELIVERY_LOCATION_ID].isna()]
+    distribution_center_mapping = pd.read_pickle("cache/otm_locations.pkl")
+    result = customer_df.merge(
+        distribution_center_mapping, left_on=Build.ITEMS_SHIP_TO_ZIPCODE, right_on="Customer zip code", how="left"
+    )
+    result = result.rename(columns={"DC Zip code": "distribution_center"})
+    result[Build.DISTRIBUTION_CENTER] = result[Build.DISTRIBUTION_CENTER].fillna(value="8101")
+    return result
+
+
+def filter_last_saved_configuration(last_configured: pd.DataFrame) -> pd.DataFrame:
+    last_configured = last_configured.loc[last_configured[Build.FINANCIAL_STATUS].isin([FinancialStatus.CONFIGURED])]
+    last_configured = last_configured.loc[
+        last_configured[Build.BUILD_TYPE_INTERNAL].isin([OrderTypeInternal.CUSTOMER_CONFIGURED])
+    ]
+    last_configured = last_configured.loc[last_configured[Build.BUILD_COUNTRY].isin(["US", "CA"])]
+    last_configured = last_configured.loc[
+        ~last_configured[Build.FULFILLMENT_STATUS].isin(["CUSTOMER_NOT_READY_TO_CONFIRM", "CUSTOMER_UNRESPONSIVE"])
+    ]
+    last_configured = last_configured.loc[~last_configured["build_batch"].isin([-2])]
+    last_configured[Build.OMS_ORDER_ID] = last_configured[Build.OMS_ORDER_ID].astype(str)
+    return last_configured
+
+
+def filter_current_df(current_df: pd.DataFrame) -> pd.DataFrame:
+    current_df = current_df[
+        [
+            Build.OMS_ORDER_ID,
+            Build.FINANCIAL_STATUS,
+            Build.FILENAME,
+            Build.EXPECTED_FG_DATE,
+            Build.ESTIMATED_DELIVERY_DATE,
+        ]
+    ]
+    df = current_df.loc[current_df[Build.FINANCIAL_STATUS].isin(["RESERVED"])]
+    print(f"Number of customers who are in RESERVED state as of today: {len(df.index)}")
+    return df
+
+
+def merge_and_rename(current_df: pd.DataFrame, last_configured: pd.DataFrame) -> pd.DataFrame:
+    df = current_df.merge(last_configured, on=Build.OMS_ORDER_ID, how="inner", validate="one_to_one")
+    df = df.loc[df["financial_status_y"] == "CONFIGURED"]
+    df.rename(columns={"financial_status_x": "financial_status"}, inplace=True)
+    return df
+
+
+def read_last_saved_configuration(current_df: pd.DataFrame) -> pd.DataFrame:
+    last_configured = pd.read_csv("outputs/2024-03-21_last_configured_state.csv")
+    last_configured = filter_last_saved_configuration(last_configured)
+    current_df = filter_current_df(current_df)
+    df = merge_and_rename(current_df, last_configured)
+
+    df[Build.BUILD_ITEMS_MOT_DRIVESYSTEM_ID] = Motor.MOT_210.code
+    df[Build.BUILD_ITEMS_BAT_RANGE_ID] = Battery.MAX_PACK.code
+    df.loc[
+        df[Build.BUILD_LINE_ITEMS_SKU].isin([SKU.R1S.code]), Build.BUILD_ITEMS_UTILITY_PANEL_ID
+    ] = UtilityPanel.UTL_S01.code
+    df.loc[
+        df[Build.BUILD_LINE_ITEMS_SKU].isin([SKU.R1T.code]), Build.BUILD_ITEMS_UTILITY_PANEL_ID
+    ] = UtilityPanel.UTL_S01.code
+    df.loc[
+        df[Build.BUILD_LINE_ITEMS_SKU].isin([SKU.R1S.code]), Build.ITEMS_UTILITY_PANEL_ID
+    ] = UtilityPanel.UTL_S01.code
+    df.loc[
+        df[Build.BUILD_LINE_ITEMS_SKU].isin([SKU.R1T.code]), Build.ITEMS_UTILITY_PANEL_ID
+    ] = UtilityPanel.UTL_S01.code
+    df[Build.BUILD_ITEMS_BADGING_ID] = AccentsAndBadging.ACTBDG_BRT.code
+    df[Build.ITEMS_BADGING_ID] = AccentsAndBadging.ACTBDG_BRT.code
+
+    df[Build.BUILD_ITEMS_CAMP_SPEAKER_ID] = Speaker.NO_SPEAKER.code
+    df[Build.ITEMS_CAMP_SPEAKER_ID] = Speaker.NO_SPEAKER.code
+
+    df[Build.BUILD_ITEMS_MATS_ID] = Mats.MAT_CHGR01.code
+    df[Build.ITEMS_MATS_ID] = Mats.MAT_CHGR01.code
+
+    df[Build.BUILD_ITEMS_AUDIO_ID] = Audio.AUD_P01.code
+    df[Build.ITEMS_AUDIO_ID] = Audio.AUD_P01.code
+
+    df[Build.BUILD_ITEMS_ROOF_GLASS_ID] = Roof.ROOF_FGP.code
+    df[Build.ITEMS_ROOF_GLASS_ID] = Roof.ROOF_FGP.code
+
+    return df
+
+
+def remove_gen_2_orders(customer_spec_df: pd.DataFrame) -> pd.DataFrame:
+    gen_mapping = input("Enter the file for generation mapping of customers")
+    path = f"cache/{gen_mapping}"
+    gen_2_flag = pd.read_csv(path)
+    customer_spec_df = customer_spec_df.merge(gen_2_flag, how="left", on="oms_order_id")
+    customer_spec_df = customer_spec_df.loc[
+        ~customer_spec_df["items_vehicle_generation_id"].isin([Architecture.PEREGRINE.code])
+    ]
+    return customer_spec_df
+
+
+def keep_only_gen_2_orders(customer_spec_df: pd.DataFrame) -> pd.DataFrame:
+    customer_spec_df = customer_spec_df.loc[
+        customer_spec_df["items_vehicle_generation_id"].isin([Architecture.PEREGRINE.code])
+    ]
+    return customer_spec_df
+
+
+def add_regions(df: pd.DataFrame) -> pd.DataFrame:
+    print("Using available mapping for cluster of service centers. Modify this as needed.")
+    region_mapping = pd.read_excel("cache/2024-09-24_distribution_center_mapping.xlsx", sheet_name="SCID-Q324")
+    region_mapping["distribution_center_text"] = region_mapping["distribution_center_text"].astype(str)
+    result = df.merge(
+        region_mapping, left_on=Build.DISTRIBUTION_CENTER, right_on="distribution_center_text", how="left"
+    )
+    return result
+
+
+def initialize_customer_df(
+    customer_spec_df: pd.DataFrame,
+    purpose: str,
+    pull_forwards_code: List[int],
+    at_normal_codes: List[int],
+    path_canceled_orders: str,
+    path_delayed_customers: str,
+) -> pd.DataFrame:
+
+    customer_spec_df = keep_only_gen_2_orders(customer_spec_df)
+
+    if purpose in {"pull_forward_from_local_sc", "pull_forward_from_normal"}:
+        matched_to_prefg_vehicle = (customer_spec_df[Build.MATCH_STATUS].isin(["REAL", "PREDICTIVE"])) & (
+            customer_spec_df[Build.VEHICLE_STATUS_CODE].isin(pull_forwards_code)
+        )
+        customer_spec_df = customer_spec_df.loc[matched_to_prefg_vehicle]
+        customer_spec_df = customer_spec_df.drop(columns=Build.DISTRIBUTION_CENTER)
+        customer_spec_df = add_distribution_center_for_customer(customer_spec_df)
+        print(f"Number of customers matched to a PRE FG build: {len(customer_spec_df.index)}")
+
+    elif purpose in {"retry_matching_normal", "retry_matching_local_sc"}:
+        specific_order_ids = ["123", "456", "789"]
+        customer_spec_df = customer_spec_df.loc[customer_spec_df[Build.OMS_ORDER_ID].isin(specific_order_ids)]
+        customer_spec_df = customer_spec_df.drop(columns=Build.DISTRIBUTION_CENTER)
+        customer_spec_df = add_distribution_center_for_customer(customer_spec_df)
+
+    elif purpose in {"customer_not_ready_to_confirm_unresponsive_normal"}:
+        customer_not_ready_unresponsive = customer_spec_df[Build.FULFILLMENT_STATUS].isin(
+            ["CUSTOMER_NOT_READY_TO_CONFIRM", "CUSTOMER_UNRESPONSIVE"]
+        )
+        customer_spec_df = customer_spec_df.loc[customer_not_ready_unresponsive]
+        print(f"Number of customers UNRESPONSIVE or NOT READY: {len(customer_spec_df.index)}")
+
+    elif purpose in {"last_saved_config_normal", "last_saved_config_local_sc_random_config"}:
+        customer_spec_df = read_last_saved_configuration(customer_spec_df)
+        print(f"Number of customers who were moved to a RESERVED state: {len(customer_spec_df.index)}")
+
+    elif purpose in {"unmatched_configured_customers_normal", "unmatched_configured_customers_local_sc"}:
+        customer_spec_df = customer_spec_df.loc[
+            customer_spec_df[Build.EXPECTED_GENERAL_ASSEMBLY_DATE] >= datetime(2025, 3, 17)
+        ]
+        customer_spec_df = customer_spec_df.loc[
+            (customer_spec_df[Build.FINANCIAL_STATUS].isin(["CONFIGURED", "ORDERED"]))
+            & ~(customer_spec_df[Build.MATCH_STATUS].isin(["REAL", "PREDICTIVE"]))
+            & (customer_spec_df[Build.BUILD_TYPE_INTERNAL].isin([OrderTypeInternal.CUSTOMER_CONFIGURED]))
+            & ~(
+                customer_spec_df[Build.FULFILLMENT_STATUS].isin(
+                    ["CUSTOMER_NOT_READY_TO_CONFIRM", "CUSTOMER_UNRESPONSIVE"]
+                )
+            )
+        ]
+        customer_spec_df = customer_spec_df.drop(columns=Build.DISTRIBUTION_CENTER)
+        customer_spec_df = add_distribution_center_for_customer(customer_spec_df)
+        print(f"Number of customers who are in UNMATCHED and CONFIGURED state: {len(customer_spec_df.index)}")
+
+    elif purpose in {"hold_strategy_matched_at_normal"}:
+        customer_spec_df = customer_spec_df.loc[
+            (customer_spec_df[Build.MATCH_STATUS].isin(["REAL", "PREDICTIVE"]))
+            & ~(customer_spec_df[Build.BUILD_BATCH].isin([-2]))
+            & (customer_spec_df[Build.VEHICLE_STATUS_CODE].isin(at_normal_codes))
+        ]
+        customer_spec_df = customer_spec_df.drop(columns=Build.DISTRIBUTION_CENTER)
+        report = (
+            customer_spec_df.groupby(by=[Build.DELIVERY_LOCATION_NAME])[Build.UNIQUE_BUILD_ID].count().reset_index()
+        )
+        print(f"Number of customers who are in UNMATCHED and CONFIGURED state: {report}")
+
+    elif purpose in {"customer_cancelled_bc_price_normal"}:
+
+        customer_spec_df = pd.read_csv(path_canceled_orders)
+        customer_spec_df = process_cancellations_data(customer_spec_df)
+        customer_spec_df = customer_spec_df.loc[
+            (
+                customer_spec_df["question1_response"].isin(
+                    ["The price is not what I expected", "The price exceeds my budget or expectations"]
+                )
+                | customer_spec_df["cancel_code"].isin(["Pricing"])
+            )
+        ]
+
+    elif purpose in {"customer_cancelled_bc_delivery_normal"}:
+        customer_spec_df = pd.read_csv(path_canceled_orders)
+        customer_spec_df = process_cancellations_data(customer_spec_df)
+        customer_spec_df = customer_spec_df.loc[
+            (
+                customer_spec_df["question1_response"].isin(
+                    [
+                        "Delivery isn't soon enough",
+                    ]
+                )
+                | customer_spec_df["cancel_code"].isin(["Delivery date"])
+            )
+        ]
+
+    elif purpose in {"unmatched_configured_customers_regionalized"}:
+        customer_spec_df = customer_spec_df.loc[
+            (customer_spec_df[Build.FINANCIAL_STATUS].isin(["CONFIGURED", "ORDERED"]))
+            & ~(customer_spec_df[Build.MATCH_STATUS].isin(["REAL", "PREDICTIVE"]))
+            & (customer_spec_df[Build.BUILD_TYPE_INTERNAL].isin([OrderTypeInternal.CUSTOMER_CONFIGURED]))
+            & ~(
+                customer_spec_df[Build.FULFILLMENT_STATUS].isin(
+                    ["CUSTOMER_NOT_READY_TO_CONFIRM", "CUSTOMER_UNRESPONSIVE"]
+                )
+            )
+        ]
+        customer_spec_df = customer_spec_df.drop(columns=Build.DISTRIBUTION_CENTER)
+        customer_spec_df = add_distribution_center_for_customer(customer_spec_df)
+        customer_spec_df = add_regions(customer_spec_df)
+        print(
+            f"Number of customers who are in UNMATCHED and CONFIGURED state and DC to DC: {len(customer_spec_df.index)}"
+        )
+
+    elif purpose in {"anywhere_to_anywhere"}:
+        customer_spec_df = customer_spec_df.loc[
+            (customer_spec_df[Build.FINANCIAL_STATUS].isin(["CONFIGURED", "ORDERED"]))
+            & ~(customer_spec_df[Build.MATCH_STATUS].isin(["REAL", "PREDICTIVE"]))
+            & (customer_spec_df[Build.BUILD_TYPE_INTERNAL].isin([OrderTypeInternal.CUSTOMER_CONFIGURED]))
+            & ~(
+                customer_spec_df[Build.FULFILLMENT_STATUS].isin(
+                    ["CUSTOMER_NOT_READY_TO_CONFIRM", "CUSTOMER_UNRESPONSIVE"]
+                )
+            )
+        ]
+        print(
+            f"Number of customers who are in UNMATCHED and CONFIGURED state and DC to DC: {len(customer_spec_df.index)}"
+        )
+    elif purpose in {"delayed_at_risk_customers_normal", "headlight_cmte_issue_normal"}:
+        delayed_customers = pd.read_csv(path_delayed_customers)
+        delayed_customers_list = [str(order_id) for order_id in delayed_customers["oms_order_id"].tolist()]
+        customer_spec_df = customer_spec_df.loc[customer_spec_df[Build.OMS_ORDER_ID].isin(delayed_customers_list)]
+        print(f"Number of customers who delayed: {len(customer_spec_df.index)}")
+
+    elif purpose in {"delayed_at_risk_customers_local_sc"}:
+        delayed_customers = pd.read_csv(path_delayed_customers)
+        delayed_customers_list = [str(order_id) for order_id in delayed_customers["oms_order_id"].tolist()]
+        customer_spec_df = customer_spec_df.loc[customer_spec_df[Build.OMS_ORDER_ID].isin(delayed_customers_list)]
+        customer_spec_df = customer_spec_df.drop(columns=Build.DISTRIBUTION_CENTER)
+        customer_spec_df = add_distribution_center_for_customer(customer_spec_df)
+        print(f"Number of customers who are delayed: {len(customer_spec_df.index)}")
+
+    # customer_spec_df.to_csv("outputs/customers_who_configured_but_not_matched.csv")
+    return customer_spec_df
+
+
+def process_cancellations_data(customer_spec_df: pd.DataFrame) -> pd.DataFrame:
+    customer_spec_df[Build.BUILD_ITEMS_ATP_ID] = customer_spec_df[Build.BUILD_ITEMS_ATP_ID].fillna(ATP.ATP_NULL.code)
+    customer_spec_df[Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID] = customer_spec_df[
+        Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID
+    ].fillna(OffRoad.ORD_NULL.code)
+    customer_spec_df = customer_spec_df.dropna(
+        subset=[
+            Build.BUILD_ITEMS_PKG_TRIM_ID,
+            Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+            Build.BUILD_ITEMS_INT_INTERIOR_ID,
+            Build.BUILD_ITEMS_WHL_WHEELS_ID,
+            Build.BUILD_ITEMS_MOT_DRIVESYSTEM_ID,
+            Build.BUILD_ITEMS_BAT_RANGE_ID,
+        ]
+    )
+    return customer_spec_df
+
+
+def initialize_vehicle_df(
+    input_data: pd.DataFrame, vehicle_state_normal: List[int], vehicle_state_local_sc: List[int], purpose: str
+) -> pd.DataFrame:
+    input_data = input_data.copy()
+    input_data = input_data.loc[input_data[Build.HOLD_TYPE].isna()]
+    input_data = input_data.loc[~input_data[Build.VEHICLE_STATUS].isin(["PRODUCTION_CONTROL_FROZEN"])]
+    input_data = input_data.loc[input_data[Build.VEHICLE_USAGE].isin(["CUSTOMER_DELIVERY"])]
+    input_data[Build.DISTRIBUTION_CENTER] = (
+        input_data[Build.DISTRIBUTION_CENTER].astype(str).str.replace(r"\.0$", "", regex=True)
+    )
+
+    if "normal" in purpose:
+        print("Shipping from Normal, IL")
+        initial_vehicle_spec = input_data.loc[
+            (input_data[Build.BUILD_TYPE_INTERNAL].isin(["Unallocated", "R1 Shop"]))
+            & ~(input_data[Build.MATCH_STATUS].isin(["REAL", "PREDICTIVE"]))
+            & (input_data[Build.VEHICLE_STATUS_CODE].isin(vehicle_state_normal))
+            & (input_data[Build.DISTRIBUTION_CENTER].isin(["8101"]))
+            & (input_data[Build.VEHICLE_ARCHITECTURE].isin([Architecture.PEREGRINE.code]))
+        ]
+    elif "local_sc" in purpose:
+        print("Shipping from Local Service Centers")
+        initial_vehicle_spec = input_data.loc[
+            (input_data[Build.BUILD_TYPE_INTERNAL].isin(["Unallocated", "R1 Shop"]))
+            & ~(input_data[Build.MATCH_STATUS].isin(["REAL", "PREDICTIVE"]))
+            & (input_data[Build.VEHICLE_STATUS_CODE].isin(vehicle_state_local_sc))
+            # & (input_data[Build.MODEL_YEAR].isin([2023, 2024]))
+            & (input_data[Build.VEHICLE_ARCHITECTURE].isin([Architecture.PEREGRINE.code]))
+        ]
+    else:
+        print("Clustering and DC to DC")
+        initial_vehicle_spec = input_data.loc[
+            (input_data[Build.BUILD_TYPE_INTERNAL].isin(["Unallocated", "R1 Shop"]))
+            & ~(input_data[Build.MATCH_STATUS].isin(["REAL", "PREDICTIVE"]))
+            & (input_data[Build.VEHICLE_STATUS_CODE].isin(vehicle_state_local_sc))
+            # & (input_data[Build.MODEL_YEAR].isin([2023, 2024]))
+            & (input_data[Build.VEHICLE_ARCHITECTURE].isin([Architecture.PEREGRINE.code]))
+        ]
+        initial_vehicle_spec = add_regions(initial_vehicle_spec)
+
+    print("Number of vehicles in the vehicles pool: ", len(initial_vehicle_spec.index))
+
+    return initial_vehicle_spec
+
+
+def generate_common_config() -> Set[str]:
+    return {
+        Build.BUILD_LINE_ITEMS_SKU,
+        Build.BUILD_ITEMS_PKG_TRIM_ID,
+        Build.BUILD_ITEMS_MOT_DRIVESYSTEM_ID,
+        Build.BUILD_ITEMS_BAT_RANGE_ID,
+        Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+        Build.BUILD_ITEMS_INT_INTERIOR_ID,
+        Build.BUILD_ITEMS_WHL_WHEELS_ID,
+        Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+        Build.BUILD_ITEMS_ATP_ID,
+        Build.BUILD_ITEMS_TONNEAU_ID,
+        Build.BUILD_COUNTRY,
+        Build.BUILD_ITEMS_ROOF_GLASS_ID,
+        Build.BUILD_ITEMS_AUDIO_ID,
+        Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+        Build.BUILD_ITEMS_BADGING_ID,
+        # Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+        # Build.BUILD_ITEMS_MATS_ID,
+    }
+
+
+def generate_accessory_option_config() -> Set[str]:
+    return {
+        Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+        Build.BUILD_ITEMS_BADGING_ID,
+        # Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+        # Build.BUILD_ITEMS_MATS_ID,
+    }
+
+
+def generate_recommendation_config(
+    enable_shipping_from_local_sc: bool,
+) -> Tuple[Dict[str, List[str]], List[str]]:
+    common_config = generate_common_config()
+    accessory_config = generate_accessory_option_config()
+
+    service_center_condition = "distribution_center"
+    order_of_steps = [
+        "exact_matches",
+        "exterior_agnostic_grouped",
+        "interior_agnostic_grouped",
+        "badging_agnostic",
+        "camp_speaker_agnostic",
+        "mats_agnostic",
+        "utility_panel_agnostic",
+        "tonneau_agnostic",
+        "audio_agnostic",
+        # "dual_dualper_quad_agnostic",
+        "wheel_agnostic",
+        "off_road_atp_agnostic",
+        "accessories_agnostic",
+        # "battery_flexible",
+        "powertrain_constant_ext_int_whl_grouped_accessories_agnostic",
+        "powertrain_constant_ext_int_grouped_accessories_agnostic",
+        "powertrain_constant",
+    ]
+
+    if enable_shipping_from_local_sc:
+        recommendation_config = {
+            "exact_matches": list(common_config) + [service_center_condition],
+            "exterior_agnostic_grouped": list(common_config - {Build.BUILD_ITEMS_EXP_EXTERIOR_ID})
+            + ["exterior_agnostic_grouped"]
+            + [service_center_condition],
+            "interior_agnostic_grouped": list(common_config - {Build.BUILD_ITEMS_INT_INTERIOR_ID})
+            + ["interior_agnostic_grouped"]
+            + [service_center_condition],
+            "badging_agnostic": list(common_config - {Build.BUILD_ITEMS_BADGING_ID})
+            + [service_center_condition]
+            + ["badging_agnostic"],
+            "camp_speaker_agnostic": list(common_config - {Build.BUILD_ITEMS_CAMP_SPEAKER_ID})
+            + [service_center_condition]
+            + ["camp_speaker_agnostic"],
+            "mats_agnostic": list(common_config - {Build.BUILD_ITEMS_MATS_ID})
+            + [service_center_condition]
+            + ["mats_agnostic"],
+            "audio_agnostic": list(common_config - {Build.BUILD_ITEMS_AUDIO_ID})
+            + [service_center_condition]
+            + ["audio_agnostic"],
+            "utility_panel_agnostic": list(common_config - {Build.BUILD_ITEMS_UTILITY_PANEL_ID})
+            + [service_center_condition],
+            "tonneau_agnostic": list(common_config - {Build.BUILD_ITEMS_TONNEAU_ID})
+            + [service_center_condition]
+            + ["utility_panel_agnostic"],
+            "battery_flex_ext_int_whl": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_BAT_RANGE_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + [service_center_condition]
+            + ["total_battery_agnostic"],
+            "battery_flex_ext_int_whl_aud_roof": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_BAT_RANGE_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + [service_center_condition]
+            + ["total_battery_agnostic"],
+            "battery_flex_ext_int": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_BAT_RANGE_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + [service_center_condition]
+            + ["total_battery_agnostic"],
+            "dual_dualper_quad_agnostic": list(common_config - {Build.BUILD_ITEMS_MOT_DRIVESYSTEM_ID})
+            + ["agnostic_motor"]
+            + [service_center_condition],
+            "wheel_agnostic": list(common_config - {Build.BUILD_ITEMS_WHL_WHEELS_ID})
+            + ["wheels_agnostic_grouped"]
+            + [service_center_condition],
+            "exterior_interior_wheels_agnostic": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                }
+            )
+            + ["total_wheel_agnostic"]
+            + ["total_exterior_agnostic"]
+            + ["total_interior_agnostic"],
+            "exterior_interior_agnostic": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                }
+            )
+            + ["total_exterior_agnostic"]
+            + ["total_interior_agnostic"],
+            "exterior_agnostic": list(common_config - {Build.BUILD_ITEMS_EXP_EXTERIOR_ID})
+            + ["total_exterior_agnostic"],
+            "accessories_agnostic": list(common_config - accessory_config) + [service_center_condition],
+            "powertrain_constant_ext_int_grouped_accessories_agnostic": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                }
+                - accessory_config
+            )
+            + ["exterior_agnostic_grouped"]
+            + ["interior_agnostic_grouped"]
+            + [service_center_condition],
+            "powertrain_constant_ext_int_whl_grouped_accessories_agnostic": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                }
+                - accessory_config
+            )
+            + ["exterior_agnostic_grouped"]
+            + ["interior_agnostic_grouped"]
+            + ["wheels_agnostic_grouped"]
+            + [service_center_condition],
+            "battery_flexible": list(common_config - {Build.BUILD_ITEMS_BAT_RANGE_ID})
+            + ["total_battery_agnostic"]
+            + [service_center_condition],
+            "off_road_atp_agnostic": list(
+                common_config - {Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID, Build.BUILD_ITEMS_ATP_ID}
+            )
+            + ["offroad_agnostic"]
+            + ["atp_agnostic"]
+            + [service_center_condition],
+            "battery_constant": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_PKG_TRIM_ID,
+                    Build.BUILD_ITEMS_MOT_DRIVESYSTEM_ID,
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + ["total_trim_agnostic"]
+            + ["agnostic_motor"]
+            + ["exterior_agnostic_grouped"]
+            + ["interior_agnostic_grouped"]
+            + [service_center_condition],
+            "powertrain_constant": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_PKG_TRIM_ID,
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + [service_center_condition],
+            "only_location_based": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_PKG_TRIM_ID,
+                    Build.BUILD_ITEMS_MOT_DRIVESYSTEM_ID,
+                    Build.BUILD_ITEMS_BAT_RANGE_ID,
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + ["total_trim_agnostic"]
+            + ["total_motor_agnostic"]
+            + ["total_battery_agnostic"]
+            + ["exterior_agnostic_grouped"]
+            + ["interior_agnostic_grouped"]
+            + ["total_wheel_agnostic"]
+            + ["offroad_agnostic"]
+            + ["atp_agnostic"]
+            + ["roof_agnostic"]
+            + ["audio_agnostic"]
+            + ["utility_panel_agnostic"]
+            + ["badging_agnostic"]
+            + ["camp_speaker_agnostic"]
+            + ["mats_agnostic"]
+            + [service_center_condition],
+        }
+    else:
+        recommendation_config = {
+            "exact_matches": list(common_config),
+            "exterior_agnostic_grouped": list(common_config - {Build.BUILD_ITEMS_EXP_EXTERIOR_ID})
+            + ["exterior_agnostic_grouped"],
+            "interior_agnostic_grouped": list(common_config - {Build.BUILD_ITEMS_INT_INTERIOR_ID})
+            + ["interior_agnostic_grouped"],
+            "badging_agnostic": list(common_config - {Build.BUILD_ITEMS_BADGING_ID}) + ["badging_agnostic"],
+            "camp_speaker_agnostic": list(common_config - {Build.BUILD_ITEMS_CAMP_SPEAKER_ID})
+            + ["camp_speaker_agnostic"],
+            "mats_agnostic": list(common_config - {Build.BUILD_ITEMS_MATS_ID}) + ["mats_agnostic"],
+            "audio_agnostic": list(common_config - {Build.BUILD_ITEMS_AUDIO_ID}) + ["audio_agnostic"],
+            "utility_panel_agnostic": list(common_config - {Build.BUILD_ITEMS_UTILITY_PANEL_ID})
+            + ["utility_panel_agnostic"],
+            "tonneau_agnostic": list(common_config - {Build.BUILD_ITEMS_TONNEAU_ID}) + ["tonneau_agnostic"],
+            "battery_flex_ext_int_whl": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_BAT_RANGE_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + ["total_battery_agnostic"],
+            "battery_flex_ext_int_whl_aud_roof": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_BAT_RANGE_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + ["total_battery_agnostic"],
+            "battery_flex_ext_int": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_BAT_RANGE_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + ["total_battery_agnostic"],
+            "dual_dualper_quad_agnostic": list(common_config - {Build.BUILD_ITEMS_MOT_DRIVESYSTEM_ID})
+            + ["agnostic_motor"],
+            "wheel_agnostic": list(common_config - {Build.BUILD_ITEMS_WHL_WHEELS_ID}) + ["wheels_agnostic_grouped"],
+            "exterior_interior_wheels_agnostic": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                }
+            )
+            + ["total_wheel_agnostic"]
+            + ["total_exterior_agnostic"]
+            + ["total_interior_agnostic"],
+            "exterior_interior_agnostic": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                }
+            )
+            + ["total_exterior_agnostic"]
+            + ["total_interior_agnostic"],
+            "exterior_agnostic": list(common_config - {Build.BUILD_ITEMS_EXP_EXTERIOR_ID})
+            + ["total_exterior_agnostic"],
+            "accessories_agnostic": list(common_config - accessory_config),
+            "powertrain_constant_ext_int_grouped_accessories_agnostic": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                }
+                - accessory_config
+            )
+            + ["exterior_agnostic_grouped"]
+            + ["interior_agnostic_grouped"],
+            "powertrain_constant_ext_int_whl_grouped_accessories_agnostic": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                }
+                - accessory_config
+            )
+            + ["exterior_agnostic_grouped"]
+            + ["interior_agnostic_grouped"]
+            + ["wheels_agnostic_grouped"],
+            "battery_flexible": list(common_config - {Build.BUILD_ITEMS_BAT_RANGE_ID}) + ["total_battery_agnostic"],
+            "off_road_atp_agnostic": list(
+                common_config - {Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID, Build.BUILD_ITEMS_ATP_ID}
+            )
+            + ["offroad_agnostic"]
+            + ["atp_agnostic"],
+            "battery_constant": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_PKG_TRIM_ID,
+                    Build.BUILD_ITEMS_MOT_DRIVESYSTEM_ID,
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + ["total_trim_agnostic"]
+            + ["agnostic_motor"]
+            + ["exterior_agnostic_grouped"]
+            + ["interior_agnostic_grouped"],
+            "powertrain_constant": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_PKG_TRIM_ID,
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            ),
+            "only_location_based": list(
+                common_config
+                - {
+                    Build.BUILD_ITEMS_PKG_TRIM_ID,
+                    Build.BUILD_ITEMS_MOT_DRIVESYSTEM_ID,
+                    Build.BUILD_ITEMS_BAT_RANGE_ID,
+                    Build.BUILD_ITEMS_EXP_EXTERIOR_ID,
+                    Build.BUILD_ITEMS_INT_INTERIOR_ID,
+                    Build.BUILD_ITEMS_WHL_WHEELS_ID,
+                    Build.BUILD_ITEMS_ATP_ID,
+                    Build.BUILD_ITEMS_ORD_OFFROADPACKAGES_ID,
+                    Build.BUILD_ITEMS_ROOF_GLASS_ID,
+                    Build.BUILD_ITEMS_AUDIO_ID,
+                    Build.BUILD_ITEMS_UTILITY_PANEL_ID,
+                    Build.BUILD_ITEMS_BADGING_ID,
+                    Build.BUILD_ITEMS_CAMP_SPEAKER_ID,
+                    Build.BUILD_ITEMS_MATS_ID,
+                }
+            )
+            + ["total_trim_agnostic"]
+            + ["total_motor_agnostic"]
+            + ["total_battery_agnostic"]
+            + ["exterior_agnostic_grouped"]
+            + ["interior_agnostic_grouped"]
+            + ["total_wheel_agnostic"]
+            + ["offroad_agnostic"]
+            + ["atp_agnostic"]
+            + ["roof_agnostic"]
+            + ["audio_agnostic"]
+            + ["utility_panel_agnostic"]
+            + ["badging_agnostic"]
+            + ["camp_speaker_agnostic"]
+            + ["mats_agnostic"],
+        }
+
+    return recommendation_config, order_of_steps
+
+
+def main() -> None:
+    component = VinRecommendationReportGenerator()
+
+    filename_model_output = input("Enter filename for the daily matching run result (.parquet file)")
+    filename_canceled_orders = input("Enter filename for the canceled orders (.csv file)")
+    filename_delayed_orders = input("Enter filename for the delayed orders (.csv file)")
+
+    path = f"cache/{filename_model_output}"
+    path_canceled_orders = f"cache/{filename_canceled_orders}"
+    path_delayed_customers = f"cache/{filename_delayed_orders}"
+
+    input_data = get_input_data(path)
+
+    pre_fg_prod_started = [300, 310, 315]
+    post_fg_codes = [320, 400, 420, 430, 440, 450, 460]
+    at_normal_codes = [100, 200, 210, 300, 310, 315, 320, 400]
+    at_local_sc_codes = [410, 420, 430, 440, 450, 460]
+    purpose_options = {
+        "1": "pull_forward_from_local_sc",
+        "2": "pull_forward_from_normal",
+        "3": "retry_matching_normal",
+        "4": "retry_matching_local_sc",
+        "5": "customer_not_ready_to_confirm_unresponsive_normal",
+        "6": "last_saved_config_normal",
+        "7": "unmatched_configured_customers_normal",
+        "8": "unmatched_configured_customers_local_sc",
+        "9": "hold_strategy_matched_at_normal",
+        "10": "customer_cancelled_bc_price_normal",
+        "11": "customer_cancelled_bc_delivery_normal",
+        "12": "unmatched_configured_customers_regionalized",
+        "13": "anywhere_to_anywhere",
+        "14": "last_saved_config_local_sc_random_config",
+        "15": "delayed_at_risk_customers_normal",
+        "16": "delayed_at_risk_customers_local_sc",
+    }
+
+    user_input = input("Enter your purpose: ")
+
+    while user_input not in purpose_options:
+        print("Invalid input. Please try again.")
+        user_input = input("Enter your purpose again: ")
+
+    purpose = purpose_options[user_input]
+
+    customer_spec_df = initialize_customer_df(
+        input_data,
+        purpose,
+        pull_forwards_code=pre_fg_prod_started,
+        at_normal_codes=at_normal_codes,
+        path_canceled_orders=path_canceled_orders,
+        path_delayed_customers=path_delayed_customers,
+    )
+    vehicle_spec_df = initialize_vehicle_df(
+        input_data, vehicle_state_normal=post_fg_codes, vehicle_state_local_sc=at_local_sc_codes, purpose=purpose
+    )
+
+    if purpose in {
+        "pull_forward_from_local_sc",
+        "retry_matching_local_sc",
+        "unmatched_configured_customers_local_sc",
+        "delayed_at_risk_customers_local_sc",
+    }:
+        recommendation_config, order_of_steps = generate_recommendation_config(enable_shipping_from_local_sc=True)
+    elif purpose in {"unmatched_configured_customers_regionalized"}:
+        recommendation_config, order_of_steps = generate_recommendation_config(enable_shipping_from_local_sc=True)
+    else:
+        recommendation_config, order_of_steps = generate_recommendation_config(enable_shipping_from_local_sc=False)
+
+    mode = "iterative"
+
+    component.run(order_of_steps, recommendation_config, vehicle_spec_df, customer_spec_df, purpose, mode)
+
+
+if __name__ == "__main__":
+    print(
+        "Starting VIN Recommendation Engine 🚂 \n"
+        "Available Options\n"
+        "1. pull_forward_from_local_sc 🏢\n"
+        "2. pull_forward_from_normal 🏭 \n"
+        "3. retry_matching_normal 🏭\n"
+        "4. retry_matching_local_sc 🏢\n"
+        "5. customer_not_ready_to_confirm_unresponsive_normal 🏭\n"
+        "6. last_saved_config_normal 🏭\n"
+        "7. unmatched_configured_customers_normal 🏭\n"
+        "8. unmatched_configured_customers_local_sc 🏢\n"
+        "9. hold_strategy_matched_at_normal 🏭\n"
+        "10. customer_cancelled_bc_price_normal 🏭💰 \n"
+        "11. customer_cancelled_bc_delivery_normal 🏭📆\n"
+        "12: unmatched_configured_customers_regionalized\n",
+        "13: anywhere_to_anywhere\n",
+        "14: last_saved_config_local_sc_random_config\n",
+        "15: delayed_at_risk_customers_normal \n",
+        "16: delayed_at_risk_customers_local_sc \n",
+    )
+    main()
